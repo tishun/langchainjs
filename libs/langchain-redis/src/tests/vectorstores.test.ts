@@ -2,7 +2,19 @@
 import { jest, test, expect, describe } from "@jest/globals";
 import { FakeEmbeddings } from "@langchain/core/utils/testing";
 
-import { RedisVectorStore } from "../vectorstores.js";
+import {
+  RedisVectorStore,
+  TagFilter,
+  NumericFilter,
+  TextFilter,
+  GeoFilter,
+  TimestampFilter,
+  Tag,
+  Num,
+  Text,
+  Geo,
+  Timestamp,
+} from "../vectorstores.js";
 
 const createRedisClientMockup = () => {
   const hSetMock = jest.fn();
@@ -305,6 +317,220 @@ describe("RedisVectorStore delete", () => {
   test("throws error if deleteAll is provided as false", async () => {
     await expect(store.delete({ deleteAll: false })).rejects.toThrow(
       'Invalid parameters passed to "delete".'
+    );
+  });
+});
+
+describe("Filter Expression Tests", () => {
+  test("TagFilter creates correct query strings", () => {
+    const tagFilter = new TagFilter("category", "electronics");
+    expect(tagFilter.toString()).toBe("@category:{electronics}");
+
+    const multiTagFilter = new TagFilter("category", ["electronics", "books"]);
+    expect(multiTagFilter.toString()).toBe("@category:{electronics|books}");
+
+    const negatedTagFilter = new TagFilter("category", "electronics", true);
+    expect(negatedTagFilter.toString()).toBe("(-@category:{electronics})");
+
+    const emptyTagFilter = new TagFilter("category", []);
+    expect(emptyTagFilter.toString()).toBe("*");
+  });
+
+  test("NumericFilter creates correct query strings", () => {
+    const eqFilter = new NumericFilter("price", "eq", 100);
+    expect(eqFilter.toString()).toBe("@price:[100 100]");
+
+    const gtFilter = new NumericFilter("price", "gt", 50);
+    expect(gtFilter.toString()).toBe("@price:[(50 +inf]");
+
+    const lteFilter = new NumericFilter("price", "lte", 200);
+    expect(lteFilter.toString()).toBe("@price:[-inf 200]");
+
+    const betweenFilter = new NumericFilter("price", "between", [50, 200]);
+    expect(betweenFilter.toString()).toBe("@price:[50 200]");
+
+    const neFilter = new NumericFilter("price", "ne", 100);
+    expect(neFilter.toString()).toBe("(-@price:[100 100])");
+  });
+
+  test("TextFilter creates correct query strings", () => {
+    const exactFilter = new TextFilter("title", "laptop", "exact");
+    expect(exactFilter.toString()).toBe('@title:("laptop")');
+
+    const wildcardFilter = new TextFilter("title", "lap*", "wildcard");
+    expect(wildcardFilter.toString()).toBe("@title:(lap*)");
+
+    const fuzzyFilter = new TextFilter("title", "laptop", "fuzzy");
+    expect(fuzzyFilter.toString()).toBe("@title:(%%laptop%%)");
+
+    const negatedFilter = new TextFilter("title", "laptop", "exact", true);
+    expect(negatedFilter.toString()).toBe('(-@title:("laptop"))');
+
+    const emptyFilter = new TextFilter("title", "", "exact");
+    expect(emptyFilter.toString()).toBe("*");
+  });
+
+  test("GeoFilter creates correct query strings", () => {
+    const geoFilter = new GeoFilter("location", -122.4194, 37.7749, 10, "km");
+    expect(geoFilter.toString()).toBe("@location:[-122.4194 37.7749 10 km]");
+
+    const negatedGeoFilter = new GeoFilter(
+      "location",
+      -122.4194,
+      37.7749,
+      10,
+      "km",
+      true
+    );
+    expect(negatedGeoFilter.toString()).toBe(
+      "(-@location:[-122.4194 37.7749 10 km])"
+    );
+  });
+
+  test("TimestampFilter creates correct query strings", () => {
+    const date = new Date("2023-01-01T00:00:00Z");
+    const epoch = Math.floor(date.getTime() / 1000);
+
+    const eqFilter = new TimestampFilter("created_at", "eq", date);
+    expect(eqFilter.toString()).toBe(`@created_at:[${epoch} ${epoch}]`);
+
+    const gtFilter = new TimestampFilter("created_at", "gt", epoch);
+    expect(gtFilter.toString()).toBe(`@created_at:[(${epoch} +inf]`);
+
+    const betweenFilter = new TimestampFilter("created_at", "between", [
+      date,
+      new Date("2023-12-31T23:59:59Z"),
+    ]);
+    const endEpoch = Math.floor(
+      new Date("2023-12-31T23:59:59Z").getTime() / 1000
+    );
+    expect(betweenFilter.toString()).toBe(`@created_at:[${epoch} ${endEpoch}]`);
+  });
+
+  test("Convenience functions work correctly", () => {
+    const tagFilter = Tag("category").eq("electronics");
+    expect(tagFilter.toString()).toBe("@category:{electronics}");
+
+    const numFilter = Num("price").between(50, 200);
+    expect(numFilter.toString()).toBe("@price:[50 200]");
+
+    const textFilter = Text("title").wildcard("lap*");
+    expect(textFilter.toString()).toBe("@title:(lap*)");
+
+    const geoFilter = Geo("location").within(-122.4194, 37.7749, 10, "km");
+    expect(geoFilter.toString()).toBe("@location:[-122.4194 37.7749 10 km]");
+
+    const timestampFilter = Timestamp("created_at").gt(new Date("2023-01-01"));
+    const epoch = Math.floor(new Date("2023-01-01").getTime() / 1000);
+    expect(timestampFilter.toString()).toBe(`@created_at:[(${epoch} +inf]`);
+  });
+
+  test("Filter combinations work correctly", () => {
+    const tagFilter = Tag("category").eq("electronics");
+    const priceFilter = Num("price").between(50, 200);
+
+    const andFilter = tagFilter.and(priceFilter);
+    expect(andFilter.toString()).toBe(
+      "(@category:{electronics} @price:[50 200])"
+    );
+
+    const orFilter = tagFilter.or(priceFilter);
+    expect(orFilter.toString()).toBe(
+      "(@category:{electronics}|@price:[50 200])"
+    );
+
+    // Test wildcard handling in combinations
+    const emptyFilter = Tag("empty").eq([]);
+    const combinedWithEmpty = tagFilter.and(emptyFilter);
+    expect(combinedWithEmpty.toString()).toBe("@category:{electronics}");
+  });
+});
+
+describe("Metadata Schema Tests", () => {
+  test("RedisVectorStore with metadata schema", async () => {
+    const client = createRedisClientMockup();
+    const embeddings = new FakeEmbeddings();
+
+    const store = new RedisVectorStore(embeddings, {
+      redisClient: client as any,
+      indexName: "documents",
+      metadataSchema: [
+        { name: "category", type: "tag" },
+        { name: "price", type: "numeric" },
+        { name: "title", type: "text" },
+        { name: "location", type: "geo" },
+        { name: "created_at", type: "timestamp" },
+      ],
+    });
+
+    expect(store).toBeDefined();
+    expect(store.metadataSchema).toHaveLength(5);
+  });
+
+  test("Advanced filter with metadata schema", async () => {
+    const client = createRedisClientMockup();
+    const embeddings = new FakeEmbeddings();
+
+    const store = new RedisVectorStore(embeddings, {
+      redisClient: client as any,
+      indexName: "documents",
+      metadataSchema: [
+        { name: "category", type: "tag" },
+        { name: "price", type: "numeric" },
+      ],
+    });
+
+    const complexFilter = Tag("category")
+      .eq("electronics")
+      .and(Num("price").between(50, 200));
+
+    await store.similaritySearch("test query", 1, complexFilter);
+
+    expect(client.ft.search).toHaveBeenCalledWith(
+      "documents",
+      "(@category:{electronics} @price:[50 200]) => [KNN 1 @content_vector $vector AS vector_score]",
+      expect.objectContaining({
+        PARAMS: {
+          vector: Buffer.from(new Float32Array([0.1, 0.2, 0.3, 0.4]).buffer),
+        },
+        RETURN: ["content", "vector_score", "category", "price", "metadata"],
+        SORTBY: "vector_score",
+        DIALECT: 2,
+        LIMIT: {
+          from: 0,
+          size: 1,
+        },
+      })
+    );
+  });
+
+  test("Backward compatibility with legacy filters", async () => {
+    const client = createRedisClientMockup();
+    const embeddings = new FakeEmbeddings();
+
+    const store = new RedisVectorStore(embeddings, {
+      redisClient: client as any,
+      indexName: "documents",
+    });
+
+    // Test legacy array filter
+    await store.similaritySearch("test query", 1, ["electronics", "books"]);
+
+    expect(client.ft.search).toHaveBeenCalledWith(
+      "documents",
+      "@metadata:(electronics|books) => [KNN 1 @content_vector $vector AS vector_score]",
+      expect.objectContaining({
+        RETURN: ["metadata", "content", "vector_score"],
+      })
+    );
+
+    // Test legacy string filter
+    await store.similaritySearch("test query", 1, "electronics");
+
+    expect(client.ft.search).toHaveBeenCalledWith(
+      "documents",
+      "@metadata:(electronics) => [KNN 1 @content_vector $vector AS vector_score]",
+      expect.any(Object)
     );
   });
 });
